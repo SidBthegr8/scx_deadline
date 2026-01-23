@@ -66,8 +66,6 @@ struct task_ctx {
 	int pid;
 };
 
-int num_nodes = 0;
-
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -90,7 +88,6 @@ struct {
 
 struct cpu_curr_task {
 	struct bpf_spin_lock lock;
-	// struct task_ctx* curr_ctx;
 	bool valid;
 	int curr_pid;
 	u64 curr_abs_dl;
@@ -142,48 +139,8 @@ struct {
 	__type(value, struct central_timer);
 } central_timer SEC(".maps");
 
-static int central_timerfn(void *map, int *key, struct bpf_timer *timer)
-{
-	int i;
-	struct task_struct* p;
-	bpf_printk("[TIMER] FALLBACK_DSQ_ID contents:\n");
-	bpf_rcu_read_lock();
-	bpf_for_each(scx_dsq, p, FALLBACK_DSQ_ID, 0) 
-	{
-		bpf_printk("%i\n", p->pid);
-	}
-	bpf_rcu_read_unlock();
-	bpf_printk("[TIMER] FALLBACK_DSQ_ID end of contents.\n");
-
-	bpf_for(i, 2, 4) 
-	{
-		// bpf_printk("Timer checking cpu %d\n", i);
-		s32 num_queued = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | i);
-		bpf_printk("[TIMER] CPU %d DSQ contents:\n", i);
-		bpf_rcu_read_lock();
-		bpf_for_each(scx_dsq, p, SCX_DSQ_LOCAL_ON | i, 0) 
-		{
-			bpf_printk("%i\n", p->pid);
-		}
-		bpf_rcu_read_unlock();
-		bpf_printk("[TIMER] CPU %d DSQ end of contents.\n", i);
-		if (num_queued > 1)
-		{
-			scx_bpf_error("[TIMER] Error: CPU %d has %d tasks in its local DSQ\n", i, num_queued);
-		}
-		// else {
-		// 	bpf_printk("CPU %d has %d tasks in its local DSQ\n", i, num_queued);
-		// }
-	}
-
-	bpf_timer_start(timer, TIMER_INTERVAL_NS, 0);
-	return 0;
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 {
-	bpf_printk("[INFO] [INIT] Starting SCX Deadline Wheel Scheduler\n");
-
 	int ret = scx_bpf_create_dsq(FALLBACK_DSQ_ID, -1);
 	if (ret)
 		return ret;
@@ -192,7 +149,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 	bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) 
 	{
 		struct cpu_curr_task curr_task;
-		// curr_task.curr_ctx = NULL;
 		curr_task.valid = false;
 		curr_task.curr_pid = -1;
 		curr_task.curr_abs_dl = 0x7FFFFFFFFFFFFFFFULL;
@@ -202,7 +158,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 			scx_bpf_error("Failed to initialize cpu_curr_task_map for cpu %d", cpu);
 			return -ENOMEM;
 		}
-		bpf_printk("[DEBUG] [INIT] Initialized running_task_ctx[cpu %d]", cpu);
+		// bpf_printk("[DEBUG] [INIT] Initialized running_task_ctx[cpu %d]", cpu);
 	}
 
 	for (u64 i = 0; i < NUM_BUCKETS; i++)
@@ -217,87 +173,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 			scx_bpf_error("Error. Failed to initialize deadline wheel slot %llu.", i);
 			return -1;
 		}
-		bpf_printk("[INFO] [INIT] Initialized deadline wheel slot # %llu.\n", i);
+		// bpf_printk("[INFO] [INIT] Initialized deadline wheel slot # %llu.\n", i);
 	}
-
-	// u32 key = 0;
-	// struct bpf_timer* timer = bpf_map_lookup_elem(&central_timer, &key);
-	// if (!timer)
-	// 	return -ESRCH;
-	// bpf_timer_init(timer, &central_timer, CLOCK_MONOTONIC);
-	// bpf_timer_set_callback(timer, central_timerfn);
-
-	// ret = bpf_timer_start(timer, TIMER_INTERVAL_NS, 0);
-	// if (ret)
-	// 	scx_bpf_error("bpf_timer_start failed (%d)", ret);
-
-
     __sync_fetch_and_add(&inited,1);
+
+	bpf_printk("[INFO] [INIT] Initialized SCX Deadline Wheel Scheduler with %d cpus and %llu bucket slots", scx_bpf_nr_cpu_ids(), NUM_BUCKETS);
 	return 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_exit, struct scx_exit_info *ei)
 {
-	// struct arena_task_node __arena * atnode;
-	// list_head = &global_head;
-	// bpf_printk("Exiting. Deleting global list at %x\n", list_head);
-	// list_for_each_entry(atnode, list_head, node) {
-    //     list_del(&atnode->node);
-	// 	//bucket->bucket_count--;
-    //     bpf_free(atnode);
-	// 	bpf_printk("Freed node at %x\n", atnode);
-    // }
-
 	bpf_printk("[INFO] [EXIT] Exiting SCX Deadline Wheel Scheduler\n");
 	UEI_RECORD(uei, ei);
 	return 0;
-}
-
-s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init_task, struct task_struct *p, struct scx_init_task_args *args)
-{
-	struct task_ctx *tctx;
-	if (!(tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE))) {
-		scx_bpf_error("Failed to allocate task_ctx for pid %d", p->pid);
-		return -ENOMEM;
-	}
-
-	struct arena_task_node __arena* new_atnode = bpf_alloc(sizeof(*new_atnode));
-	if (new_atnode == NULL)
-	{
-		scx_bpf_error("Failed to allocate new node for pid %d", p->pid);
-		return -ENOMEM;
-	}
-	bpf_printk("Allocated node for pid %d at address 0x%x\n", p->pid, new_atnode);
-	tctx->valid = false;
-	tctx->atnode = new_atnode;
-	tctx->pid = p->pid;
-	tctx->abs_deadline = 0x7FFFFFFFFFFFFFFFULL;
-	//new_atnode->id = __sync_fetch_and_add(&num_nodes, 1);
-
-	// int node_id = new_atnode->id;
-	// int pid = p->pid;
-	new_atnode->pid = p->pid;
-	new_atnode->cpumask = 0;
-	new_atnode->in_bucket = false;
-	// int res = bpf_map_update_elem(&node_id_to_pid, &node_id, &pid, BPF_ANY);
-	// if (res)
-	// {
-	// 	scx_bpf_error("Failed to set node id %d mapping for pid %d. Error: %d", node_id, p->pid, res);
-	// 	return -ENOMEM;
-	// }
-
-	// list_head = &global_head;
-	// // list_add_head(&tctx->atnode->node, list_head);
-	// bpf_printk("Added node for pid %d (0x%x) to global list.\n", p->pid, new_atnode);
-	
-	bpf_printk("[INFO] [TASK_INIT] Task %d (%s)initialized. Policy = %d.\n", p->pid, p->comm, p->policy);
-	return 0;
-}
-
-void BPF_STRUCT_OPS(deadline_wheel_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
-{
-	if (p->policy != 7) return;
-	bpf_printk("[INFO] [TASK_EXIT] Task %d (%s) policy=%u exited\n", p->pid, p->comm, p->policy);
 }
 
 static u64 get_rel_deadline(struct task_struct *p)
@@ -326,22 +214,33 @@ static u64 get_rel_deadline(struct task_struct *p)
 void BPF_STRUCT_OPS(deadline_wheel_enable, struct task_struct *p)
 {
 	scx_arena_subprog_init();
-	bpf_printk("[DEBUG] [ENABLE] Enabling task %d\n", p->pid);
 	u64 rel_dl = get_rel_deadline(p);
-	bpf_printk("[DEBUG] [ENABLE] Got relative deadline for task %d: %llu\n", p->pid, rel_dl);
+	bpf_printk("[DEBUG] [ENABLE] Enabling task %d with relative deadline %llu\n", p->pid, rel_dl);
 	u64 abs_deadline = scx_bpf_now() + rel_dl;
 
+	// Create a new task context structure for this thread
 	struct task_ctx *tctx;
-	// If we start a task and then start the scheduler after, then it's possible we never
-	// got into the .init_task function for this task. If this happens, we can't allocate a node now.
-	// So error out, if we hit this case.
-	if (!(tctx = bpf_task_storage_get(&task_ctx_stor, p, NULL, 0))) {
-		scx_bpf_error("task_ctx lookup failed in enable");
+	if (!(tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE))) {
+		scx_bpf_error("Failed to allocate task_ctx for pid %d", p->pid);
 		return;
 	}
 
+	// Allocate a new arena linked list node for this thread
+	struct arena_task_node __arena* new_atnode = bpf_alloc(sizeof(*new_atnode));
+	if (new_atnode == NULL)
+	{
+		scx_bpf_error("Failed to allocate new node for pid %d", p->pid);
+		return;
+	}
+	bpf_printk("Allocated node for pid %d at address 0x%x\n", p->pid, new_atnode);
+	
+	new_atnode->pid = p->pid;
+	new_atnode->cpumask = 0;
+	new_atnode->in_bucket = false;
+
 	// Set the context parameters
 	bpf_spin_lock(&tctx->lock);
+	tctx->atnode = new_atnode;
 	tctx->abs_deadline = abs_deadline;
 	tctx->pid = p->pid;
 	tctx->valid = true;
@@ -349,27 +248,13 @@ void BPF_STRUCT_OPS(deadline_wheel_enable, struct task_struct *p)
 	bpf_spin_unlock(&tctx->lock);
 	bpf_printk("[INFO] [ENABLE] Set task %d mask to 0x%x\n.", p->pid, tctx->atnode->cpumask);
 
-	// struct bpf_cpumask *kptr;
-	// struct cpumasks_kfunc_map_value *v;
-	// int key = p->pid;
-	// bpf_cpumask_copy(tctx->atnode->cpumask, p->cpus_ptr);
-	// int res = bpf_map_update_elem(&cpumasks_kfunc_map, &v, &curr_task, BPF_ANY);
-	// if (res)
-	// {
-	// 	scx_bpf_error("Error looking up cpumask for pid %d.", p->pid);
-	// 	return;
-	// }
-
 	struct arena_task_node __arena* atnode_addr = tctx->atnode;
 	struct arena_list_node __arena* list_node_addr = NULL;
 	if (tctx->atnode) list_node_addr = &(tctx->atnode->node);
 
 	u64 time_from_now_us = (abs_deadline - scx_bpf_now())/1000ULL;
-	bpf_printk("[DEBUG] [ENABLE] Task %d node = 0x%x, atnode = 0x%x\n", p->pid, list_node_addr, atnode_addr);
-	// bpf_printk("[INFO] [ENABLE] Task %d (%s) policy=%u enabled. Mask = %x. Rel. DL = %llu ns, Abs. DL = %llu (time from now = %llu us).\n",
-	// 	p->pid, p->comm, p->policy, *(int*)(p->cpus_ptr), rel_dl, time_from_now_us);
-	bpf_printk("[INFO] [ENABLE] Task %d (%s) policy=%u enabled. Mask = %x.\n",
-		p->pid, p->comm, p->policy, *(int*)(p->cpus_ptr));
+	bpf_printk("[DEBUG] [ENABLE] Task %d (%s) policy=%u, mask=%x, node = 0x%x, atnode = 0x%x\n", 
+		p->pid, p->comm, p->policy, *(int*)(p->cpus_ptr), list_node_addr, atnode_addr);
 }
 
 void BPF_STRUCT_OPS(deadline_wheel_disable, struct task_struct *p)
@@ -385,8 +270,6 @@ void BPF_STRUCT_OPS(deadline_wheel_disable, struct task_struct *p)
 	tctx->valid = false;
 	tctx->abs_deadline = 0x7FFFFFFFFFFFFFFFULL;
 	bpf_spin_unlock(&tctx->lock);
-	// bpf_cpumask_release(tctx->atnode->cpumask);
-	tctx->atnode->cpumask = 0;
 
 	if (tctx->atnode->in_bucket)
 	{
@@ -396,51 +279,26 @@ void BPF_STRUCT_OPS(deadline_wheel_disable, struct task_struct *p)
 			scx_bpf_error("Failed to get bucket idx %llu pointer, after creating it", bucket_idx);
 			return;
 		}
-		if (bucket)
+
+		bpf_spin_lock(&bucket->lock);
+		if (tctx->atnode && tctx->atnode->in_bucket)
 		{
-			int deleted_node = 0;
-			bpf_spin_lock(&bucket->lock);
-			if (tctx->atnode && tctx->atnode->in_bucket)
-			{
-				list_del(&tctx->atnode->node);
-				tctx->atnode->in_bucket = false;
-				bucket->bucket_count--;
-				deleted_node = 1;
-			}
-			bpf_spin_unlock(&bucket->lock);
-			if (deleted_node)
-			{
-				struct arena_task_node __arena* atnode2 = NULL;
-				int error = 0;
-				bpf_spin_lock(&bucket->lock);
-				list_for_each_entry(atnode2, bucket->head_ptr, node)
-				{
-					if (atnode2->pid == tctx->atnode->pid)
-					{
-						error = 1;
-						break;
-					}
-				}
-				bpf_spin_unlock(&bucket->lock);
-				if (error)
-				{
-					scx_bpf_error("Error, pid %d was still in list, after removing it.", tctx->atnode->pid);
-				}
-				
-				if (((&tctx->atnode->node)->next != LIST_POISON1))
-					scx_bpf_error("deleted node->next %x != LIST_POISON1(%x)", (u64)((&tctx->atnode->node)->next), (u64)(LIST_POISON1));
-				if (((&tctx->atnode->node)->pprev != LIST_POISON2))
-					scx_bpf_error("deleted node->pprev %x != LIST_POISON2(%x)", (u64)((&tctx->atnode->node)->pprev), (u64)(LIST_POISON2));
-			}
-			bpf_printk("[INFO] [DISABLE] Removed pid %d from bucket %llu. %d tasks remain in bucket\n", p->pid, bucket_idx, bucket->bucket_count);
-			struct arena_task_node __arena* atnode = NULL;
-			print_bucket_list(bucket_idx, bucket);
-			if (bucket->bucket_count < 0)
-			{
-				scx_bpf_error("[ERROR] [DISABLE] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
-			}
+			list_del(&tctx->atnode->node);
+			tctx->atnode->in_bucket = false;
+			bucket->bucket_count--;
+		}
+		bpf_spin_unlock(&bucket->lock);
+		
+		bpf_printk("[INFO] [DISABLE] Removed pid %d from bucket %llu. %d tasks remain in bucket\n", p->pid, bucket_idx, bucket->bucket_count);
+		print_bucket_list(bucket_idx, bucket);
+		if (bucket->bucket_count < 0)
+		{
+			scx_bpf_error("[ERROR] [DISABLE] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 		}
 	}
+
+    bpf_free(tctx->atnode);
+	tctx->atnode = NULL;
 
 	bpf_printk("[INFO] [DISABLE] Task %d (%s) disabled\n", p->pid, p->comm);
 }
@@ -465,13 +323,7 @@ static struct task_ctx *lookup_task_ctx(struct task_struct *p)
 static s32 find_idle_cpu(struct task_struct *p, s32 prev_cpu)
 {
 
-
-	// if (p->nr_cpus_allowed == 1)
-	// {
-	// 	bpf_printk("Prev cpu (%d) is the only one allowed for %s-%d", prev_cpu, p->comm, p->pid);	
-	// 	return prev_cpu;
-	// }
-
+	// First check if the previous cpu the task ran on is now available. This can help avoid migration
 	u32 key;
 	bool prev_cpu_idle = scx_bpf_test_and_clear_cpu_idle(prev_cpu);
 	if(prev_cpu_idle)
@@ -485,19 +337,11 @@ static s32 find_idle_cpu(struct task_struct *p, s32 prev_cpu)
 		}	
 	}
 	
+	// Look for any other idle cpu
 	s32 cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 	if (cpu >= 0)
 	{
-		// TODO: is this really needed?
-		bpf_rcu_read_lock();
-		u64 nr_queued = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
-		bpf_rcu_read_unlock();
-		if (nr_queued > 0)
-		{
-			return -1;
-		}
-		key = cpu;
-		struct cpu_curr_task* cpu_curr_task_ctx = bpf_map_lookup_elem(&cpu_curr_task_map, &key);
+		struct cpu_curr_task* cpu_curr_task_ctx = bpf_map_lookup_elem(&cpu_curr_task_map, &cpu);
 		if (!cpu_curr_task_ctx || !(cpu_curr_task_ctx->valid))
 		{
 			bpf_printk("[DEBUG] [HELPER] Found idle cpu (%d) that's in mask", cpu);
@@ -623,13 +467,14 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	p_tctx->atnode->in_bucket = true;
 	bucket->bucket_count++;
 	bpf_spin_unlock(&bucket->lock);
+	print_bucket_list(bucket_idx, bucket);
 	if (error)
 	{
+		bpf_printk("Re-insertion error\n");
 		scx_bpf_error("Error, pid %d was already in list, but re-inserted it again.", p_tctx->atnode->pid);
 	}
 	
 	
-	print_bucket_list(bucket_idx, bucket);
 	bpf_printk("Inserted pid %d into deadline wheel bucket %llu. Num tasks in bucket = %d\n", p_tctx->pid, bucket_idx, bucket->bucket_count);
 
 	if (bucket->bucket_count < 0)
@@ -710,8 +555,8 @@ void BPF_STRUCT_OPS(deadline_wheel_running, struct task_struct *p)
 void BPF_STRUCT_OPS(deadline_wheel_stopping, struct task_struct *p, bool runnable)
 {
 	u64 now = scx_bpf_now();
-	bpf_printk("[INFO] [STOPPING] Stopping task %d (%s), [slice=%llu][runnable = %d]\n", p->pid, p->comm, p->scx.slice, (int)runnable);
 	u32 cpu = scx_bpf_task_cpu(p);
+	bpf_printk("[INFO] [STOPPING] Stopping task %d (%s) on cpu %d, [slice=%llu][runnable = %d]\n", p->pid, p->comm, cpu, p->scx.slice, (int)runnable);
 	struct cpu_curr_task* curr_task;
 	curr_task = bpf_map_lookup_elem(&cpu_curr_task_map, &cpu);
 	if (!curr_task)
@@ -803,6 +648,8 @@ static long check_deadline_wheel_slot(u64 iteration, void* ctx)
 		bpf_spin_unlock(&bucket->lock);
 		if (error)
 		{
+			bpf_printk("Not removed error.\n");
+			print_bucket_list(bucket_idx, bucket);
 			scx_bpf_error("Error, pid %d was still in list, after removing it.", bucket_data->pid);
 		}
 
@@ -827,14 +674,14 @@ static long check_deadline_wheel_slot(u64 iteration, void* ctx)
 void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 {
 	if (cpu != 2 && cpu !=3) return;
-	bpf_printk("[INFO] [DISPATCH] CPU %d dispatching\n", cpu);
+	//bpf_printk("[INFO] [DISPATCH] CPU %d dispatching\n", cpu);
     if (inited == 0) return;
-    // bpf_printk("[INFO] [DISPATCH] Starting dispatch for CPU %d\n", cpu);
 	scx_arena_subprog_init();
 	if (prev && prev->policy == 7)
 	{
 		bpf_printk("[INFO] [DISPATCH] CPU %d dispatching from deadline wheel. Prev was pid %d (%s)(policy %d) with slice %llu.\n", cpu, prev->pid, prev->comm, prev->policy, prev->scx.slice);
 	}
+	// bpf_printk("[INFO] [DISPATCH] CPU %d dispatching from deadline wheel.\n", cpu);
 
 	u64 curr_time_ns = scx_bpf_now();
 	u64 curr_time_bucket_idx = curr_time_ns % NUM_BUCKETS;
@@ -912,24 +759,29 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 	}
 }
 
-void BPF_STRUCT_OPS(deadline_wheel_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
+SEC("tp_btf/sched_switch")
+int BPF_PROG(deadline_wheel_sched_switch, bool preempt, struct task_struct *prev,
+         struct task_struct *next, unsigned long prev_state)
 {
-	u64 now = scx_bpf_now();
-	bool is_kthread = (args->task->flags & PF_KTHREAD);
-	if (!is_kthread)
-	{
-		int num_tasks_reenqueued = scx_bpf_reenqueue_local();
-		bpf_printk("[DEBUG] [RELEASE] Reenqued %d tasks from CPU %d's local DSQ\n", 
-			num_tasks_reenqueued, cpu);
-	}
-	bpf_printk("[DEBUG] [RELEASE] CPU %d is released, reason: %u, next prio: %u, next pid: %lu, next comm: %s, kthread: %d\n", 
-		cpu, args->reason, args->task->prio, args->task->pid, args->task->comm, is_kthread);
-}
+    if (!__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
+        return 0;
 
-void BPF_STRUCT_OPS(deadline_wheel_cpu_acquire, s32 cpu, struct scx_cpu_acquire_args *args)
-{
-	u64 now = scx_bpf_now();
-	bpf_printk("[DEBUG] [ACQUIRE] CPU %d is acquired\n", cpu);
+	bool is_kthread = (next->flags & PF_KTHREAD);
+
+    // Core is getting taken by a task of a higher-priority scheduling class.
+    // This next task isn't a kthread, so it might take a while before sched-ext gets the core again. 
+    // Reenqueue local DSQ tasks in the meantime so they can run elsewhere.
+    if (preempt && !is_kthread) {
+        scx_bpf_reenqueue_local();
+		int cpu = bpf_get_smp_processor_id();
+		if (prev->policy == 7 && next->policy != 7)
+		{
+			bpf_printk("[DEBUG] [SCHED-SWITCH] CPU %d is released, next prio: %u, next pid: %lu, next comm: %s, kthread: %d\n", 
+				cpu, next->prio, next->pid, next->comm, is_kthread);
+		}
+    }
+
+    return 0;
 }
 
 void BPF_STRUCT_OPS(deadline_wheel_quiescent, struct task_struct *p, u64 deq_flags) {
@@ -938,19 +790,19 @@ void BPF_STRUCT_OPS(deadline_wheel_quiescent, struct task_struct *p, u64 deq_fla
 	if (deq_flags & SCX_DEQ_CORE_SCHED_EXEC)
 		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) going quiescent on cpu %d, because the generic core-sched layer decided to execute the task even though it hasn't been dispatched yet. Dequeue from the BPF side.\n", p->pid, p->comm, cpu);
 	if (deq_flags & 0x01)
-		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) dequeued because it's being sleeped\n", p->pid, p->comm);
+		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) quiescent because it's being sleeped\n", p->pid, p->comm);
 	 if (deq_flags & 0x02)
-		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) dequeued because it's being sleeped\n", p->pid, p->comm);
+		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) quiescent because it's being saved\n", p->pid, p->comm);
 	 if (deq_flags & 0x04)
-		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) dequeued because it's being moved\n", p->pid, p->comm);
+		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) quiescent because it's being moved\n", p->pid, p->comm);
 	 if (deq_flags & 0x08)
-		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) dequeued because no clock\n", p->pid, p->comm);
+		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) quiescent because no clock\n", p->pid, p->comm);
 	 if (deq_flags & 0x10)
-		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) dequeued because special\n", p->pid, p->comm);
+		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) quiescent because special\n", p->pid, p->comm);
 	 if (deq_flags & 0x100)
-		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) dequeued because migrating\n", p->pid, p->comm);
+		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) quiescent because migrating\n", p->pid, p->comm);
 	 if (deq_flags & 0x200)
-		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) dequeued because delayed\n", p->pid, p->comm);
+		bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) quiescent because delayed\n", p->pid, p->comm);
 	
 	bpf_printk("[DEBUG] [QUIESCENT] Task %d (%s) going quiescent [slice=%llu]\n", p->pid, p->comm, p->scx.slice);
 }
@@ -958,13 +810,14 @@ void BPF_STRUCT_OPS(deadline_wheel_quiescent, struct task_struct *p, u64 deq_fla
 void BPF_STRUCT_OPS(deadline_wheel_runnable, struct task_struct *p, u64 enq_flags)
 {
 	u64 now = scx_bpf_now();
+	bool enqueue_restore = enq_flags & 0x0002;
 	if (enq_flags &  SCX_ENQ_WAKEUP )
 	{
-		bpf_printk("[INFO] [RUNNABLE] Task %d (%s) [slice=%llu] is runnable (waking up)\n", p->pid, p->comm, p->scx.slice);
+		bpf_printk("[INFO] [RUNNABLE] Task %d (%s) [slice=%llu] is runnable (waking up) [ENQUEUE_RESTORE=%d]\n", p->pid, p->comm, p->scx.slice, enqueue_restore);
 	}
 	else
 	{
-		bpf_printk("[INFO] [RUNNABLE] Task %d (%s) [slice=%llu] is runnable (migrated or restored after attribute change)\n", p->pid, p->comm, p->scx.slice);
+		bpf_printk("[INFO] [RUNNABLE] Task %d (%s) [slice=%llu] is runnable (migrated or restored after attribute change) [ENQUEUE_RESTORE=%d]\n", p->pid, p->comm, p->scx.slice, enqueue_restore);
 	}
 }
 
@@ -1043,6 +896,8 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 		bpf_spin_unlock(&bucket->lock);
 		if (error)
 		{
+			bpf_printk("Not removed error.\n");
+			print_bucket_list(bucket_idx, bucket);
 			scx_bpf_error("Error, pid %d was still in list, after removing it.", tctx->atnode->pid);
 		}
 	}
@@ -1124,23 +979,11 @@ void BPF_STRUCT_OPS(deadline_wheel_dump, struct scx_dump_ctx *dctx)
 	}
 }
 
-void BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_cpu_online, s32 cpu)
-{
-	bpf_printk("CPU %d going offline\n", cpu);
-}
-
-void BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_cpu_offline, s32 cpu)
-{
-	bpf_printk("CPU %d coming online\n", cpu);
-}
-
 SCX_OPS_DEFINE(deadline_wheel_ops,
 	.flags			= SCX_OPS_ENQ_LAST | SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_MIGRATION_DISABLED,
 	.name			= "deadline",
 	.init			= (void *)deadline_wheel_init,
 	.exit			= (void *)deadline_wheel_exit,
-	.init_task		= (void *)deadline_wheel_init_task,
-	.exit_task		= (void *)deadline_wheel_exit_task,
 	.enable			= (void *)deadline_wheel_enable,
 	.disable		= (void *)deadline_wheel_disable,
 	.select_cpu		= (void *)deadline_wheel_select_cpu,
@@ -1150,168 +993,6 @@ SCX_OPS_DEFINE(deadline_wheel_ops,
 	.stopping		= (void *)deadline_wheel_stopping,
 	.dispatch		= (void *)deadline_wheel_dispatch,
 	.quiescent		= (void *)deadline_wheel_quiescent,
-	.cpu_acquire	= (void *)deadline_wheel_cpu_acquire,
-	.cpu_release	= (void *)deadline_wheel_cpu_release,
-	.cpu_online		= (void *)deadline_wheel_cpu_online,
-	.cpu_offline	= (void *)deadline_wheel_cpu_offline,
 	.runnable		= (void *)deadline_wheel_runnable,
 	.dump			= (void *)deadline_wheel_dump
 );
-
-	
-	// .runnable		= (void *)deadline_wheel_runnable,
-	// .quiescent		= (void *)deadline_wheel_quiescent,
-	// .cpu_acquire	= (void *)deadline_wheel_cpu_acquire,
-	// .cpu_release	= (void *)deadline_wheel_cpu_release,
-	
-	// .init_task		= (void *)deadline_wheel_init_task,
-	// .exit_task		= (void *)deadline_wheel_exit_task,
-	// .dump_task		= (void *)deadline_wheel_dump_task,
-
-#include <bpf/bpf_tracing.h>
-#include <bpf/bpf_helpers.h>
-
-SEC("raw_tp/sched_switch")
-int BPF_PROG(handle_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next)
-{
-	int cpu = bpf_get_smp_processor_id();
-	// if (!(cpu == 2 || cpu == 3))
-	// {
-    // 	return 0;
-	// }
-
-	int prev_pid = BPF_CORE_READ(prev, pid);
-	int next_pid = BPF_CORE_READ(next, pid);
-
-	char prev_comm[20];
-	char next_comm[20];
-
-	int ret = bpf_probe_read_kernel_str(prev_comm, sizeof(prev_comm), prev->comm);
-    if (ret < 0) {
-        bpf_printk("Failed to read prev process name, error: %d\n", ret);
-        return 0;
-    }
-
-	ret = bpf_probe_read_kernel_str(next_comm, sizeof(next_comm), next->comm);
-    if (ret < 0) {
-        bpf_printk("Failed to read next process name, error: %d\n", ret);
-        return 0;
-    }
-
-	bool prev_match = ((prev_comm[0] == 's') && (prev_comm[1] == 'a') && (prev_comm[2] == 'm') && (prev_comm[3] == 'p'));
-	bool next_match = ((next_comm[0] == 's') && (next_comm[1] == 'a') && (next_comm[2] == 'm') && (next_comm[3] == 'p'));
-	if (!(prev_match || next_match))
-	{
-		return 0;
-	}
-
-	int prev_prio = BPF_CORE_READ(prev, prio);
-	int next_prio = BPF_CORE_READ(next, prio);
-
-	unsigned int prev_state = BPF_CORE_READ(prev, __state);
-	bpf_printk("[%d] Switch %s-%d (prio=%d, state=%d) ==> %s-%d (prio=%d)\n", 
-		cpu, prev_comm, prev_pid, prev_prio, prev_state, next_comm, next_pid, next_prio);
-	return 0;
-}
-/*
-struct sched_migrate_task_args {
-    unsigned short common_type;
-    unsigned char common_flags;
-    unsigned char common_preempt_count;
-    int common_pid;
-    long __data_loc_comm; 
-    pid_t pid;      // offset:12
-    int prio;       // offset:16
-    int orig_cpu;   // offset:20
-    int dest_cpu;   // offset:24
-};
-
-// Use the standard function definition, passing the context structure as the only argument
-SEC("tp/sched/sched_migrate_task")
-int sched_migrate_task_handler(struct sched_migrate_task_args *ctx)
-{
-    char comm[TASK_COMM_LEN];
-
-    // The verifier now knows R1 is a pointer to struct sched_migrate_task_args
-    bpf_get_current_comm(comm, sizeof(comm));
-
-    bpf_printk("MIGRATION: %s (PID: %d) moved from CPU %d to CPU %d",
-               comm, 
-               ctx->pid, 
-               ctx->orig_cpu, 
-               ctx->dest_cpu);
-
-    return 0;
-}*/
-
-// SEC("raw_tp/sched_wakeup")
-// int BPF_PROG(handle_sched_wakeup, struct task_struct *p)
-// {
-//  	int cpu = bpf_get_smp_processor_id();
-// 	if (!(cpu == 2 || cpu == 3))
-// 	{
-//     	return 0;
-// 	}
-
-// 	int pid = BPF_CORE_READ(p, pid);
-
-// 	char comm[20];
-// 	int ret = bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm);
-//     if (ret < 0) {
-//         bpf_printk("Failed to read prev process name, error: %d\n", ret);
-//         return 0;
-//     }
-
-// 	int prio = BPF_CORE_READ(p, prio);
-
-// 	bpf_printk("[%d] Wakeup %s-%d\n", cpu, comm, pid);
-// 	return 0;
-// }
-
-// SEC("raw_tp/sched_wakeup_new")
-// int BPF_PROG(handle_sched_wakeup_new, struct task_struct *p)
-// {
-//  	int cpu = bpf_get_smp_processor_id();
-// 	if (!(cpu == 2 || cpu == 3))
-// 	{
-//     	return 0;
-// 	}
-
-// 	int pid = BPF_CORE_READ(p, pid);
-
-// 	char comm[20];
-// 	int ret = bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm);
-//     if (ret < 0) {
-//         bpf_printk("Failed to read prev process name, error: %d\n", ret);
-//         return 0;
-//     }
-
-// 	int prio = BPF_CORE_READ(p, prio);
-
-// 	bpf_printk("[%d] Wakeup new %s-%d\n", cpu, comm, pid);
-// 	return 0;
-// }
-
-// SEC("raw_tp/sched_waking")
-// int BPF_PROG(handle_sched_waking, struct task_struct *p)
-// {
-//  	int cpu = bpf_get_smp_processor_id();
-// 	if (!(cpu == 2 || cpu == 3))
-// 	{
-//     	return 0;
-// 	}
-
-// 	int pid = BPF_CORE_READ(p, pid);
-
-// 	char comm[20];
-// 	int ret = bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm);
-//     if (ret < 0) {
-//         bpf_printk("Failed to read prev process name, error: %d\n", ret);
-//         return 0;
-//     }
-
-// 	int prio = BPF_CORE_READ(p, prio);
-
-// 	bpf_printk("[%d] Waking %s-%d\n", cpu, comm, pid);
-// 	return 0;
-// }
