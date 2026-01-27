@@ -1,3 +1,4 @@
+#include <math.h>
 #define BPF_NO_KFUNC_PROTOTYPES
 // #include <asm-generic/errno-base.h>
 #include <scx/common.bpf.h>
@@ -37,6 +38,7 @@ struct {
 
 static int inited;
 static bool scx_arena_verify_once;
+static u64 __arena * bucket_bitmask_array;
 
 __hidden void scx_arena_subprog_init(void)
 {
@@ -175,6 +177,21 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 		}
 		// bpf_printk("[INFO] [INIT] Initialized deadline wheel slot # %llu.\n", i);
 	}
+
+	bucket_bitmask_array = NULL;
+	// Create as many u64s needed to represent each bucket with a bit
+	int num_bitfields = ceil((double)NUM_BUCKETS / (double)64);
+	bucket_bitmask_array = bpf_alloc(sizeof(u64) * num_bitfields);
+	if (bucket_bitmask_array == NULL)
+	{
+		scx_bpf_error("Failed to allocate bitmask array");
+		return -1;
+	}
+	bpf_printk("Allocated bitmask array with %d u64s\n", num_bitfields);
+	for (int i = 0; i < num_bitfields; i++)
+	{
+		bucket_bitmask_array[i] = (u64)0;
+	}
     __sync_fetch_and_add(&inited,1);
 
 	bpf_printk("[INFO] [INIT] Initialized SCX Deadline Wheel Scheduler with %d cpus and %llu bucket slots", scx_bpf_nr_cpu_ids(), NUM_BUCKETS);
@@ -183,6 +200,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_exit, struct scx_exit_info *ei)
 {
+	bpf_free(bucket_bitmask_array);
 	bpf_printk("[INFO] [EXIT] Exiting SCX Deadline Wheel Scheduler\n");
 	UEI_RECORD(uei, ei);
 	return 0;
@@ -476,11 +494,19 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	
 	
 	bpf_printk("Inserted pid %d into deadline wheel bucket %llu. Num tasks in bucket = %d\n", p_tctx->pid, bucket_idx, bucket->bucket_count);
+	
+	int u64_array_idx = bucket_idx / 64;
+	int bit_idx = bucket_idx % 64;
+	bucket_bitmask_array[u64_array_idx] |= (1 << bit_idx);
+	bpf_printk("Enabled bit for bucket index %llu; array idx = %d, bit idx = %d, bucket_bitmask_array[%d]=0x%x\n", 
+			bucket_idx, u64_array_idx, bit_idx, u64_array_idx, bucket_bitmask_array[u64_array_idx]);
 
 	if (bucket->bucket_count < 0)
 	{
 		scx_bpf_error("[ERROR] [HELPER] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 	}
+
+	
 	return 0;
 }
 
@@ -723,6 +749,12 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		}
 
+		int u64_array_idx = bucket_data.found_task_bucket / 64;
+		int bit_idx = bucket_data.found_task_bucket % 64;
+		bucket_bitmask_array[u64_array_idx] = bucket_bitmask_array[u64_array_idx] & ~(1 << bit_idx);
+		bpf_printk("Disabled bit for bucket index %llu; array idx = %d, bit idx = %d, bucket_bitmask_array[%d]=0x%x\n", 
+			bucket_data.found_task_bucket, u64_array_idx, bit_idx, u64_array_idx, bucket_bitmask_array[u64_array_idx]);
+
 		pid = tstruct->pid;
 		u64 mask = (u64)*(int*)tstruct->cpus_ptr;
 		bpf_task_release(tstruct);
@@ -901,6 +933,12 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 			scx_bpf_error("Error, pid %d was still in list, after removing it.", tctx->atnode->pid);
 		}
 	}
+
+	int u64_array_idx = bucket_idx / 64;
+	int bit_idx = bucket_idx % 64;
+	bucket_bitmask_array[u64_array_idx] = bucket_bitmask_array[u64_array_idx] & ~(1 << bit_idx);
+	bpf_printk("[DEQUEUE] Disabled bit for bucket index %llu; array idx = %d, bit idx = %d, bucket_bitmask_array[%d]=0x%x\n", 
+		bucket_idx, u64_array_idx, bit_idx, u64_array_idx, bucket_bitmask_array[u64_array_idx]);
 
 	if (((&tctx->atnode->node)->next != LIST_POISON1))
 		scx_bpf_error("deleted node->next %x != LIST_POISON1(%x)", (u64)((&tctx->atnode->node)->next), (u64)(LIST_POISON1));
