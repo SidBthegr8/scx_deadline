@@ -20,7 +20,7 @@ UEI_DEFINE(uei);
 #define NS_IN_SEC 1000000000ULL
 #define FALLBACK_DSQ_ID 0
 
-#define NUM_BUCKETS 10
+#define NUM_BUCKETS 100
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #define NR_L0 DIV_ROUND_UP(NUM_BUCKETS, 64)
 #define NR_L1 (NR_L0 > 1 ? DIV_ROUND_UP(NR_L0, 64) : 0)
@@ -66,7 +66,7 @@ static inline void set_bitmask_tree(struct bucket_bitmask_data *b_data,
 {
 	u64 curr_idx = bucket_idx / 64;
 	u64 bit = bucket_idx % 64;
-	bpf_printk("[set_bitmask_tree] bucket_idx: %d", bucket_idx);
+	// bpf_printk("[set_bitmask_tree] bucket_idx: %d", bucket_idx);
 	#pragma unroll
 	for (int l = 0; l < 4; l++) {
 		if (l >= NUM_LEVELS)
@@ -78,10 +78,10 @@ static inline void set_bitmask_tree(struct bucket_bitmask_data *b_data,
 		u64 old_val =
 					b_data->bitmasks[final_idx];
 		b_data->bitmasks[final_idx] |= (1ULL << bit);
-		bpf_printk(
-			"[set_bitmask_tree] final_idx: %d, b_data->bitmasks[final_idx]:0x%x",
-			final_idx,
-			b_data->bitmasks[final_idx]);
+		// bpf_printk(
+		// 	"[set_bitmask_tree] final_idx: %d, b_data->bitmasks[final_idx]:0x%llx",
+		// 	final_idx,
+		// 	b_data->bitmasks[final_idx]);
 			 
 		if (old_val != 0) {break;}
 
@@ -95,7 +95,7 @@ clear_bitmask_tree(struct bucket_bitmask_data *b_data, u64 bucket_idx)
 {
 	u64 curr_idx = bucket_idx / 64;
 	u64 bit = bucket_idx % 64;
-	bpf_printk("[set_bitmask_tree] bucket_idx: %d", bucket_idx);
+	// bpf_printk("[clear_bitmask_tree] bucket_idx: %d", bucket_idx);
 	#pragma unroll
 	for (int l = 0; l < 4; l++) {
 		if (l >= NUM_LEVELS)
@@ -107,9 +107,9 @@ clear_bitmask_tree(struct bucket_bitmask_data *b_data, u64 bucket_idx)
 			break;
 		}
 		b_data->bitmasks[final_idx] &= ~(1ULL << bit);
-		bpf_printk(
-			"[clear_bitmask_tree] final_idx: %d, b_data->bitmasks[final_idx]:0x%x",
-			final_idx, b_data->bitmasks[final_idx]);
+		// bpf_printk(
+		// 	"[clear_bitmask_tree] final_idx: %d, b_data->bitmasks[final_idx]:0x%llx",
+		// 	final_idx, b_data->bitmasks[final_idx]);
 		if (b_data->bitmasks[final_idx] != 0)
 			break;
 		bit = curr_idx % 64;
@@ -129,7 +129,11 @@ get_highest_bitmask_tree(struct bucket_bitmask_data *b_data)
 			continue;
 
 		int offset = get_level_offset(l);
-		u64 val = b_data->bitmasks[offset + curr_idx];
+		u64 final_idx = offset + curr_idx;
+		if (final_idx >= MAX_BITMASK_U64S || final_idx<0) {
+			return ~0ULL; // or break/return depending on the function
+		}
+		u64 val = b_data->bitmasks[final_idx];
 		if (val == 0)
 			return -1;
 
@@ -139,7 +143,7 @@ get_highest_bitmask_tree(struct bucket_bitmask_data *b_data)
 
 		curr_idx = (curr_idx * 64) + highest_bit;
 		// bpf_printk(
-		// 	 "[get_highest_bitmask_tree] curr_idx: %d, b_data->bitmasks[offset + curr_idx]: 0x%x",
+		// 	 "[get_highest_bitmask_tree] curr_idx: %d, b_data->bitmasks[offset + curr_idx]: 0x%llx",
 		// 	curr_idx, b_data->bitmasks[offset + curr_idx]);
 	}
 	return -1;
@@ -333,6 +337,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 	}
 
 	bpf_spin_lock(&b_data->lock);
+	#pragma unroll
 	for (int i = 0; i < MAX_BITMASK_U64S; i++) {
 		b_data->bitmasks[i] = 0;
 	}
@@ -652,9 +657,9 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	struct bucket_bitmask_data *b_data =
 		bpf_map_lookup_elem(&bucket_bitmask_map, &bitmask_key);
 	if (b_data) {
-		// bpf_spin_lock(&b_data->lock);
+		bpf_spin_lock(&b_data->lock);
 		set_bitmask_tree(b_data, bucket_idx);
-		// bpf_spin_unlock(&b_data->lock);
+		bpf_spin_unlock(&b_data->lock);
 	}
 
 	if (bucket->bucket_count < 0)
@@ -944,11 +949,11 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 		// }
 
 		// if(bucket->bucket_count==0){
-			// bpf_spin_lock(b_data->lock);
+			bpf_spin_lock(&b_data->lock);
 		    clear_bitmask_tree(b_data, bucket_data.found_task_bucket);
-		    // bpf_spin_unlock(b_data->lock);
+		    bpf_spin_unlock(&b_data->lock);
 		    bpf_printk(
-			    "Diabled bit using clear_bitmask_tree for bucket index %llu",
+			    "[DISPATCH] Disabled bit using clear_bitmask_tree for bucket index %llu",
 			    bucket_data.found_task_bucket);
 		// }
 		    
