@@ -101,8 +101,8 @@ void fib_thread(unsigned int n, int thread_num) {
     std::string fib = fibonacci_str(n,thread_num);
     std::lock_guard<std::mutex> lock(cout_mutex);
     std::cout << "[Thread " << thread_num << "] Done\n";
-    //std::cout << "[Thread " << thread_num << "] F_" << n << " = " << fib << "\n";
-    //std::cout << "[Thread " << thread_num << "] Number of digits: " << fib.size() << "\n";
+    std::cout << "[Thread " << thread_num << "] F_" << n << " = " << fib << "\n";
+    std::cout << "[Thread " << thread_num << "] Number of digits: " << fib.size() << "\n";
 }
 
 // Checks if a string consists only of digits
