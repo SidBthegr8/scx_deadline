@@ -150,6 +150,24 @@ get_highest_bitmask_tree(struct bucket_bitmask_data *b_data)
 	return -1;
 }
 
+static void print_bucket_tree()
+{
+	scx_bpf_dump("[PRINT_BUCKET_TREE] Bucket Bitmask Tree Dump");
+	u32 key = 0;
+	struct bucket_bitmask_data *b_data =
+		bpf_map_lookup_elem(&bucket_bitmask_map, &key);
+	int i;
+	bpf_for(i, 0, MAX_BITMASK_U64S) {
+		
+		u64 val;
+		bpf_spin_lock(&b_data->lock);
+		val = b_data->bitmasks[i];
+		bpf_spin_unlock(&b_data->lock);
+
+		scx_bpf_dump("  [Index %d]: 0x%llx", i, val);
+	}
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARENA);
     __uint(map_flags, BPF_F_MMAPABLE);
@@ -962,7 +980,7 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 {
 	// if (cpu != 2 && cpu !=3) return;
 	// if (cpu != 2) return;
-	bpf_printk("[INFO] [DISPATCH] CPU %d dispatching\n", cpu);
+	// bpf_printk("[INFO] [DISPATCH] CPU %d dispatching\n", cpu);
     if (inited == 0) return;
 	scx_arena_subprog_init();
 	// if (prev && prev->policy == 7)
@@ -997,12 +1015,12 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 	if(b_data){
 		// bpf_spin_lock(&b_data->lock);
 		slock(&b_data->sem);
-		bpf_printk("[DISPATCH] Got b_data->sem lock!!!");
+		// bpf_printk("[DISPATCH] Got b_data->sem lock!!!");
 		// int highest_nonempty_idx = get_highest_bit(b_data->bitmasks[0]);
 		highest_nonempty_idx = get_highest_bitmask_tree(b_data);
 		// bpf_printk("[INFO] [DISPATCH] highest_nonempty_idx: %d", highest_nonempty_idx);
-		if(highest_nonempty_idx==-1) {bpf_printk("[INFO] [DISPATCH] Deadline wheel is empty");}
-		// if(highest_nonempty_idx==-1){}
+		// if(highest_nonempty_idx==-1) {bpf_printk("[INFO] [DISPATCH] Deadline wheel is empty");}
+		if(highest_nonempty_idx==-1){}
 		else{
 		// bool check = check_deadline_wheel_slot(highest_nonempty_idx,
 		// 				       loop_ctx);
@@ -1138,8 +1156,8 @@ int BPF_PROG(deadline_wheel_sched_switch, bool preempt, struct task_struct *prev
 		int cpu = bpf_get_smp_processor_id();
 		if (prev->policy == 7 && next->policy != 7)
 		{
-			bpf_printk("[DEBUG] [SCHED-SWITCH] CPU %d is released, next prio: %u, next pid: %lu, next comm: %s, kthread: %d\n", 
-				cpu, next->prio, next->pid, next->comm, is_kthread);
+			bpf_printk("[DEBUG] [SCHED-SWITCH] CPU %d is released, prev pid: %d, next prio: %u, next pid: %lu, next comm: %s, kthread: %d\n", 
+				cpu, prev->pid, next->prio, next->pid, next->comm, is_kthread);
 		}
     }
 
@@ -1345,6 +1363,7 @@ void BPF_STRUCT_OPS(deadline_wheel_dump, struct scx_dump_ctx *dctx)
 		bpf_rcu_read_unlock();
 		scx_bpf_dump("[TIMER] CPU %d DSQ end of contents.\n", i);
 	}
+	print_bucket_tree();
 }
 
 void BPF_STRUCT_OPS(deadline_exit_task, struct task_struct *p, struct scx_exit_task_args *args){
