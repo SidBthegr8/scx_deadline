@@ -860,7 +860,8 @@ static inline long check_deadline_wheel_slot(u64 iteration, void* ctx)
 
 void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 {
-	if (cpu != 2 && cpu !=3) return;
+	// if (cpu != 2 && cpu !=3) return;
+	if (cpu != 2) return;
 	//bpf_printk("[INFO] [DISPATCH] CPU %d dispatching\n", cpu);
     if (inited == 0) return;
 	scx_arena_subprog_init();
@@ -896,7 +897,7 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 		// int highest_nonempty_idx = get_highest_bit(b_data->bitmasks[0]);
 		u64 highest_nonempty_idx = get_highest_bitmask_tree(b_data);
 		bpf_spin_unlock(&b_data->lock);
-		bpf_printk("[INFO] [DISPATCH] highest_nonempty_idx: %d 0x%x", highest_nonempty_idx, b_data->bitmasks[0]);
+		bpf_printk("[INFO] [DISPATCH] highest_nonempty_idx: %d", highest_nonempty_idx);
 		if(highest_nonempty_idx==-1) {bpf_printk("[INFO] [DISPATCH] Deadline wheel is empty");}
 		else{
 		bool check = check_deadline_wheel_slot(highest_nonempty_idx,
@@ -942,20 +943,21 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 		//     bucket_data.found_task_bucket, u64_array_idx, bit_idx,
 		//     u64_array_idx, bucket_bitmask_array[u64_array_idx]);
 
-	    // struct deadline_wheel_slot *bucket = bpf_map_lookup_elem(&dl_wheel, &bucket_data.found_task_bucket);
-		// if(bucket==NULL){
-		// 	scx_bpf_error("[DISPATCH] Critical Error!");
-		// 	return;
-		// }
+	    struct deadline_wheel_slot *bucket = bpf_map_lookup_elem(&dl_wheel, &bucket_data.found_task_bucket);
+		if(bucket==NULL){
+			bpf_task_release(tstruct);
+			scx_bpf_error("[DISPATCH] Critical Error!");
+			return;
+		}
 
-		// if(bucket->bucket_count==0){
+		if(bucket->bucket_count==0){
 			bpf_spin_lock(&b_data->lock);
 		    clear_bitmask_tree(b_data, bucket_data.found_task_bucket);
 		    bpf_spin_unlock(&b_data->lock);
 		    bpf_printk(
 			    "[DISPATCH] Disabled bit using clear_bitmask_tree for bucket index %llu",
 			    bucket_data.found_task_bucket);
-		// }
+		}
 		    
 
 		    pid = tstruct->pid;
@@ -990,7 +992,13 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 	    } else {
 		    s32 num_fallback = scx_bpf_dsq_nr_queued(FALLBACK_DSQ_ID);
 		    if (num_fallback > 0) {
-			    bpf_printk(
+				bpf_printk("Fallback DSQ contents:");
+			    struct task_struct *pt;
+				bpf_for_each(scx_dsq, pt, FALLBACK_DSQ_ID, 0) 
+				{
+					bpf_printk("%i\n", pt->pid);
+				}
+				bpf_printk(
 				    "Couldn't find a task in the deadline wheel, but the fallback dsq isn't empty (%d tasks).\n",
 				    num_fallback);
 		    }
