@@ -150,23 +150,9 @@ get_highest_bitmask_tree(struct bucket_bitmask_data *b_data)
 	return -1;
 }
 
-static void print_bucket_tree()
-{
-	scx_bpf_dump("[PRINT_BUCKET_TREE] Bucket Bitmask Tree Dump");
-	u32 key = 0;
-	struct bucket_bitmask_data *b_data =
-		bpf_map_lookup_elem(&bucket_bitmask_map, &key);
-	int i;
-	bpf_for(i, 0, MAX_BITMASK_U64S) {
-		
-		u64 val;
-		bpf_spin_lock(&b_data->lock);
-		val = b_data->bitmasks[i];
-		bpf_spin_unlock(&b_data->lock);
 
-		scx_bpf_dump("  [Index %d]: 0x%llx", i, val);
-	}
-}
+
+
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARENA);
@@ -182,6 +168,54 @@ struct {
 
 #include "bpf_arena_alloc.h"
 #include "bpf_arena_list.h"
+
+struct slock_ctx {
+	int *val;
+	bool got_lock;
+};
+
+static inline long slock_work(u32 index, void *ctx){
+	// bpf_printk("[SLOCK_WORK] Entering slock_work");	
+	struct slock_ctx *lctx = ctx;
+	/* Return 1 to stop looping (we got the lock) */
+	/* Return 0 to continue looping */
+	if (__sync_val_compare_and_swap(lctx->val, 0, 1) == 0)
+	{
+		lctx->got_lock = true;
+		return 1;
+	}
+	// bpf_printk("[SLOCK_WORK] CAS false for index %d", index);
+	for(int temp=0; temp<100000; temp++){}
+	return 0;
+}
+
+static void slock(int* val){
+	// bpf_printk("[SLOCK] Entering slock");	
+	struct slock_ctx lctx = { .val = val, .got_lock = false};
+	u32 iters = 1<<23;
+	long res = bpf_loop(iters, slock_work, &lctx, 0);
+	if (res == -E2BIG) 
+	{
+		bpf_printk("[SLOCK] iters %lu exceeds max", iters);
+	}
+	else if(res == -EINVAL)
+	{
+		bpf_printk("[SLOCK] iters %lu is invalid", iters);
+	}
+	else if(res == iters)
+	{
+		bpf_printk("[SLOCK] res %lu hit iters %lu",  res, iters);
+	}
+	// else
+	// {
+	// 	bpf_printk("[SLOCK] looped %lu times, iters=%d",  res, iters);
+	// }
+	if(!lctx.got_lock){
+		int cpu = bpf_get_smp_processor_id();
+		bpf_printk("[SLOCK] [Cpu %d] Couldn't get lock!!!", cpu);
+		scx_bpf_error("[SLOCK] [Cpu %d] Couldn't get lock!!!", cpu);
+	}
+}
 
 static int inited;
 static bool scx_arena_verify_once;
@@ -274,6 +308,7 @@ static void print_bucket_list(u64 bucket_idx, struct deadline_wheel_slot* bucket
 }
 
 
+
 // static inline int get_highest_bit(u64 val)
 // {
 // 	if (val == 0)
@@ -297,8 +332,61 @@ struct {
 	__type(value, struct central_timer);
 } central_timer SEC(".maps");
 
+static void dump_bucket_tree()
+{
+	scx_bpf_dump("[DUMP_BUCKET_TREE] Bucket Bitmask Tree Dump");
+	u32 key = 0;
+	struct bucket_bitmask_data *b_data =
+		bpf_map_lookup_elem(&bucket_bitmask_map, &key);
+	int i;
+	bpf_for(i, 0, MAX_BITMASK_U64S) {
+		
+		u64 val;
+		// bpf_spin_lock(&b_data->lock);
+		val = b_data->bitmasks[i];
+		// bpf_spin_unlock(&b_data->lock);
+
+		scx_bpf_dump("  [Index %d]: 0x%llx", i, val);
+	}
+}
+
+static void print_bucket_tree()
+{
+	bpf_printk("[PRINT_BUCKET_TREE] Bucket Bitmask Tree Dump");
+	u32 key = 0;
+	struct bucket_bitmask_data *b_data =
+		bpf_map_lookup_elem(&bucket_bitmask_map, &key);
+	int i;
+	bpf_for(i, 0, MAX_BITMASK_U64S) {
+		
+		u64 val;
+		// bpf_spin_lock(&b_data->lock);
+		// slock(&b_data->sem);
+		val = b_data->bitmasks[i];
+		// bpf_spin_unlock(&b_data->lock);
+		// __sync_val_compare_and_swap(&b_data->sem, 1, 0);
+
+		bpf_printk("  [Index %d]: 0x%llx (%d)", i, val, __builtin_popcountll(val));
+	}
+	for (u64 i = 0; i < NUM_BUCKETS; i++)
+	{
+		struct deadline_wheel_slot* bucket;
+		if (!(bucket = bpf_map_lookup_elem(&dl_wheel, &i))) {
+			continue;
+		}
+		if(bucket->bucket_count==0){continue;}
+		bpf_printk("[%llu][%d tasks]: ", i, bucket->bucket_count);
+		struct arena_task_node __arena * atnode = NULL;
+		list_for_each_entry(atnode, bucket->head_ptr, node)
+		{
+			bpf_printk("\t%d->", atnode->pid);
+		}
+	}
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 {
+	bpf_printk("[INIT] Entering init fn");
 	int ret = scx_bpf_create_dsq(FALLBACK_DSQ_ID, -1);
 	if (ret)
 		return ret;
@@ -358,13 +446,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(deadline_wheel_init)
 		return -1;
 	}
 
-	bpf_spin_lock(&b_data->lock);
 	#pragma unroll
 	for (int i = 0; i < MAX_BITMASK_U64S; i++) {
 		b_data->bitmasks[i] = 0;
 	}
-	bpf_spin_unlock(&b_data->lock);
-
+	__sync_lock_test_and_set(&b_data->sem, 0);
+	print_bucket_tree();
 	__sync_fetch_and_add(&inited, 1);
 
 	bpf_printk("[INFO] [INIT] Initialized SCX Deadline Wheel Scheduler with %d cpus and %llu bucket slots", scx_bpf_nr_cpu_ids(), NUM_BUCKETS);
@@ -456,32 +543,7 @@ void BPF_STRUCT_OPS(deadline_wheel_enable, struct task_struct *p)
 		p->pid, p->comm, p->policy, *(int*)(p->cpus_ptr), list_node_addr, atnode_addr);
 }
 
-struct slock_ctx {
-	int *val;
-	bool got_lock;
-};
 
-static inline long slock_work(u32 index, void *ctx){
-	struct slock_ctx *lctx = ctx;
-	/* Return 1 to stop looping (we got the lock) */
-	/* Return 0 to continue looping */
-	if (__sync_val_compare_and_swap(lctx->val, 0, 1) == 0)
-	{
-		lctx->got_lock = true;
-		return 1;
-	}
-	for(int temp=0; temp<100000; temp++){}
-	return 0;
-}
-
-static void slock(int* val){	
-	struct slock_ctx lctx = { .val = val, .got_lock = false};
-
-	bpf_loop(100000, slock_work, &lctx, 0);
-	if(!lctx.got_lock){
-		scx_bpf_error("[SLOCK] Couldn't get lock!!!");
-	}
-}
 
 void BPF_STRUCT_OPS(deadline_wheel_disable, struct task_struct *p)
 {
@@ -516,14 +578,15 @@ void BPF_STRUCT_OPS(deadline_wheel_disable, struct task_struct *p)
 			bucket->bucket_count--;
 		}
 		// bpf_spin_unlock(&bucket->lock);
-		__sync_val_compare_and_swap(&bucket->sem, 1, 0);
-		
 		bpf_printk("[INFO] [DISABLE] Removed pid %d from bucket %llu. %d tasks remain in bucket\n", p->pid, bucket_idx, bucket->bucket_count);
 		print_bucket_list(bucket_idx, bucket);
 		if (bucket->bucket_count < 0)
 		{
 			scx_bpf_error("[ERROR] [DISABLE] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 		}
+		__sync_val_compare_and_swap(&bucket->sem, 1, 0);
+		
+		
 	}
 
     bpf_free(tctx->atnode);
@@ -697,9 +760,10 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	list_add_head(&p_tctx->atnode->node, list_head);
 	p_tctx->atnode->in_bucket = true;
 	bucket->bucket_count++;
-	// bpf_spin_unlock(&bucket->lock);
-	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
 	print_bucket_list(bucket_idx, bucket);
+	// bpf_spin_unlock(&bucket->lock);
+	
+	
 	if (error)
 	{
 		bpf_printk("Re-insertion error\n");
@@ -708,7 +772,6 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	
 	
 	bpf_printk("Inserted pid %d into deadline wheel bucket %llu. Num tasks in bucket = %d\n", p_tctx->pid, bucket_idx, bucket->bucket_count);
-	
 	// int u64_array_idx = bucket_idx / 64;
 	// int bit_idx = bucket_idx % 64;
 	// bucket_bitmask_array[u64_array_idx] |= (1 << bit_idx);
@@ -723,6 +786,7 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 		slock(&b_data->sem);
 		bpf_printk("[INSERT] Got b_data lock!!!");
 		set_bitmask_tree(b_data, bucket_idx);
+		print_bucket_tree();
 		// bpf_spin_unlock(&b_data->lock);
 		__sync_val_compare_and_swap(&b_data->sem, 1, 0);
 	}
@@ -731,7 +795,7 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	{
 		scx_bpf_error("[ERROR] [HELPER] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 	}
-
+	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
 	
 	return 0;
 }
@@ -840,22 +904,24 @@ struct bucket_loop_data {
 	s32 cpu;
 };
 
-static inline struct task_ctx* fetch_from_bucket(u64 bucket_idx, struct bucket_bitmask_data *b_data, s32 cpu){
+static inline int fetch_from_bucket(u64 bucket_idx, struct bucket_bitmask_data *b_data, s32 cpu){
 	struct deadline_wheel_slot* bucket;
-	struct task_ctx* ctx = NULL;
+	int pid = -1;
 	if (!(bucket = bpf_map_lookup_elem(&dl_wheel, &bucket_idx))) {
-		return NULL;
+		return -1;
 		// scx_bpf_error("Failed to get bucket idx %llu pointer, after creating it", bucket_idx);
 	}
 	slock(&bucket->sem);
 	bpf_printk("[FETCH] Got bucket->sem lock!!!!");
 	if (bucket->bucket_count == 0)
 	{
+		bpf_printk("[FETCH] Bucket %lu is empty", bucket_idx);
 		goto done;
 	}
 	if (!bucket->head_ptr)
 	{
-		return NULL;
+		bpf_printk("[FETCH] Bucket %lu head ptr is null", bucket_idx);
+		goto done;
 		// scx_bpf_error("Invalid bucket head pointer for bucket %llu.", bucket_idx);
 	}
 
@@ -864,7 +930,7 @@ static inline struct task_ctx* fetch_from_bucket(u64 bucket_idx, struct bucket_b
 	{
 		struct task_struct *tstruct = bpf_task_from_pid(atnode->pid);
 	    if (!tstruct) {
-			return NULL;
+			goto done;
 		    // scx_bpf_error(
 			//     "Invalid task_struct pointer for 'found' task_ctx (pid = %d)",
 			//     atnode->pid);
@@ -873,11 +939,14 @@ static inline struct task_ctx* fetch_from_bucket(u64 bucket_idx, struct bucket_b
 		bpf_task_release(tstruct);
 	    if (can_run_on_cpu) {
 		    list_del(&atnode->node);
+			pid = atnode->pid;
 			atnode->in_bucket = false;
 			bucket->bucket_count--;
 			if(bucket->bucket_count==0){
 				// bpf_spin_lock(&b_data->lock);
 				clear_bitmask_tree(b_data, bucket_idx);
+				bpf_printk("[FETCH] cleared bit %d from bitmask", bucket_idx);
+				print_bucket_tree();
 				// bpf_spin_unlock(&b_data->lock);
 				
 				// bpf_printk(
@@ -890,7 +959,7 @@ static inline struct task_ctx* fetch_from_bucket(u64 bucket_idx, struct bucket_b
 
 	done:
 	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
-	return ctx;
+	return pid;
 }
 
 // static inline long check_deadline_wheel_slot(u64 iteration, void* ctx)
@@ -1010,7 +1079,7 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 	// bpf_printk("[INFO] [DISPATCH] highest_nonempty_idx: %d 0x%x", highest_nonempty_idx, bucket_bitmask_array[0]);
 	u32 bucket_bitmask_key=0;
 	struct bucket_bitmask_data *b_data = bpf_map_lookup_elem(&bucket_bitmask_map, &bucket_bitmask_key);
-	struct task_ctx* tctx = NULL;
+	int pid = -1;
 	u64 highest_nonempty_idx;
 	if(b_data){
 		// bpf_spin_lock(&b_data->lock);
@@ -1026,13 +1095,13 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 		// 				       loop_ctx);
 		// if (check) {bpf_printk("[INFO] [DISPATCH] correctly identified bucket!");}
 		// else {bpf_printk("[INFO] [DISPATCH] problem identifying correct bucket!");}
-			tctx = fetch_from_bucket(highest_nonempty_idx, b_data, cpu);
-			if(tctx==NULL) {bpf_printk("[DISPATCH] Found %d but bucket was empty", highest_nonempty_idx);}
+			pid = fetch_from_bucket(highest_nonempty_idx, b_data, cpu);
+			if(pid == -1) {bpf_printk("[DISPATCH] Found %d but bucket was empty", highest_nonempty_idx);}
 		}
 		// bpf_spin_unlock(&b_data->lock);
 		__sync_val_compare_and_swap(&b_data->sem, 1, 0);
 	}
-	if(!b_data || !tctx) {return;}
+	if(!b_data || pid == -1) {return;}
     
 	    // if (bucket_data.pid == -1) {
 		//     scx_bpf_error(
@@ -1084,8 +1153,6 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 		// 	    highest_nonempty_idx);
 		// }
 		    
-
-		    int pid = tctx->pid;
 			struct task_struct *tstruct = bpf_task_from_pid(pid);
 			if (!tstruct) {
 				scx_bpf_error(
@@ -1230,56 +1297,8 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 	u64 bucket_idx = tctx->atnode->bucket;
 	struct deadline_wheel_slot* bucket;
 	if (!(bucket = bpf_map_lookup_elem(&dl_wheel, &bucket_idx))) {
-		scx_bpf_error("Failed to get bucket idx %llu pointer, after creating it", bucket_idx);
 		return;
-	}
-
-	bpf_spin_lock(&bucket->lock);
-	if (bucket->bucket_count == 0)
-	{
-		bpf_spin_unlock(&bucket->lock);
-		return;
-	}
-
-	int not_in_bucket = 0;
-	if(tctx->atnode)
-	{
-		if (!(tctx->atnode->in_bucket))
-		{
-			not_in_bucket = 1;
-
-		}
-		list_del(&tctx->atnode->node);
-		tctx->atnode->in_bucket = false;
-		bucket->bucket_count--;
-	}
-	bpf_spin_unlock(&bucket->lock);
-
-	if(tctx->atnode)
-	{
-		if (not_in_bucket)
-		{
-			scx_bpf_error("[ERROR] [DEQUEUE] Error: Tried to dequeue pid %d, but its not in a bucket.", tctx->atnode->pid);
-		}
-	
-		struct arena_task_node __arena* atnode2 = NULL;
-		int error = 0;
-		bpf_spin_lock(&bucket->lock);
-		list_for_each_entry(atnode2, bucket->head_ptr, node)
-		{
-			if (atnode2->pid == tctx->atnode->pid)
-			{
-				error = 1;
-				break;
-			}
-		}
-		bpf_spin_unlock(&bucket->lock);
-		if (error)
-		{
-			bpf_printk("Not removed error.\n");
-			print_bucket_list(bucket_idx, bucket);
-			scx_bpf_error("Error, pid %d was still in list, after removing it.", tctx->atnode->pid);
-		}
+		// scx_bpf_error("Failed to get bucket idx %llu pointer, after creating it", bucket_idx);
 	}
 
 	// int u64_array_idx = bucket_idx / 64;
@@ -1288,16 +1307,43 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 	// bpf_printk("[DEQUEUE] Disabled bit for bucket index %llu; array idx = %d, bit idx = %d, bucket_bitmask_array[%d]=0x%x\n", 
 	// 	bucket_idx, u64_array_idx, bit_idx, u64_array_idx, bucket_bitmask_array[u64_array_idx]);
 
-	if (((&tctx->atnode->node)->next != LIST_POISON1))
-		scx_bpf_error("deleted node->next %x != LIST_POISON1(%x)", (u64)((&tctx->atnode->node)->next), (u64)(LIST_POISON1));
-	if (((&tctx->atnode->node)->pprev != LIST_POISON2))
-		scx_bpf_error("deleted node->pprev %x != LIST_POISON2(%x)", (u64)((&tctx->atnode->node)->pprev), (u64)(LIST_POISON2));
-	bpf_printk("[INFO] [DEQUEUE] Removed pid %d from bucket %llu. %d tasks remain in bucket\n", p->pid, bucket_idx, bucket->bucket_count);
-	print_bucket_list(bucket_idx, bucket);
-	if (bucket->bucket_count < 0)
+	s32 key = 0;
+	struct bucket_bitmask_data *b_data =
+		bpf_map_lookup_elem(&bucket_bitmask_map, &key);
+	slock(&bucket->sem);
+	bpf_printk("[DEQUEUE] Got bucket->sem lock!!!!");
+	if (bucket->bucket_count == 0)
 	{
-		scx_bpf_error("[ERROR] [DEQUEUE] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
+		goto dequeue_done;
 	}
+	if (!bucket->head_ptr)
+	{
+		goto dequeue_done;
+		// scx_bpf_error("Invalid bucket head pointer for bucket %llu.", bucket_idx);
+	}
+	if (tctx->atnode->in_bucket){
+		slock(&b_data->sem);
+		list_del(&tctx->atnode->node);
+		tctx->atnode->in_bucket = false;
+		bucket->bucket_count--;
+		bpf_printk("[DEQUEUE] removed task %d from bucket %lu", p->pid, bucket_idx);
+		if(bucket->bucket_count==0){
+			// bpf_spin_lock(&b_data->lock);
+			clear_bitmask_tree(b_data, bucket_idx);
+			bpf_printk("[DEQUEUE] cleared bit %d from bitmask", bucket_idx);
+			print_bucket_tree();
+			// bpf_spin_unlock(&b_data->lock);
+			
+			// bpf_printk(
+			// 	"[FETCH_FROM_BUCKET] Disabled bit using clear_bitmask_tree for bucket index %llu",
+			// 	bucket_idx);
+
+		}
+		__sync_val_compare_and_swap(&b_data->sem, 1, 0);
+	 }
+
+	dequeue_done:
+	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
 }
 
 void BPF_STRUCT_OPS(deadline_wheel_dump, struct scx_dump_ctx *dctx)
@@ -1363,13 +1409,13 @@ void BPF_STRUCT_OPS(deadline_wheel_dump, struct scx_dump_ctx *dctx)
 		bpf_rcu_read_unlock();
 		scx_bpf_dump("[TIMER] CPU %d DSQ end of contents.\n", i);
 	}
-	print_bucket_tree();
+	dump_bucket_tree();
 }
 
 void BPF_STRUCT_OPS(deadline_exit_task, struct task_struct *p, struct scx_exit_task_args *args){
 	s32 pid = p->pid;
 	bpf_map_delete_elem(&task_relative_deadlines_map, &pid);
-	bpf_printk("[EXIT_TASK] deleting task %d", pid);
+	// bpf_printk("[EXIT_TASK] deleting task %d", pid);
 }
 
 SCX_OPS_DEFINE(deadline_wheel_ops,
