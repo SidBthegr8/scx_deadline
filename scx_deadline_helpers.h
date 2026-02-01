@@ -12,7 +12,7 @@ struct task_rel_dl {
 	uint64_t	rel_deadline;
 };
 
-#define MAP_PIN_PATH "/sys/fs/bpf/tsk_rel_dl"
+#define MAP_PIN_PATH "/sys/fs/bpf/task_relative_deadlines_map"
 
 uint64_t get_rel_deadline(int tid)
 {

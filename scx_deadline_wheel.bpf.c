@@ -150,10 +150,6 @@ get_highest_bitmask_tree(struct bucket_bitmask_data *b_data)
 	return -1;
 }
 
-
-
-
-
 struct {
     __uint(type, BPF_MAP_TYPE_ARENA);
     __uint(map_flags, BPF_F_MMAPABLE);
@@ -215,6 +211,10 @@ static void slock(int* val){
 		bpf_printk("[SLOCK] [Cpu %d] Couldn't get lock!!!", cpu);
 		scx_bpf_error("[SLOCK] [Cpu %d] Couldn't get lock!!!", cpu);
 	}
+}
+
+static void sunlock(int* val){ 
+	*val = 0;
 }
 
 static int inited;
@@ -293,7 +293,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, int);
     __type(value, struct task_rel_dl);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 10240);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } task_relative_deadlines_map SEC(".maps");
 
@@ -487,10 +487,10 @@ static u64 get_rel_deadline(struct task_struct *p)
 	// struct task_rel_dl new_rel_dl;
 	// new_rel_dl.rel_deadline = NS_IN_SEC;
 	struct task_rel_dl new_rel_dl = { .rel_deadline = NS_IN_SEC };
-	int res = bpf_map_update_elem(&task_relative_deadlines_map, &pid, &new_rel_dl, BPF_ANY|BPF_F_LOCK);
+	long res = bpf_map_update_elem(&task_relative_deadlines_map, &pid, &new_rel_dl, BPF_ANY|BPF_F_LOCK);
 	if (res)
 	{
-		scx_bpf_error("tsk_rel_dl update failed for pid %d", pid);
+		scx_bpf_error("tsk_rel_dl update failed for pid %d; error = %ld", pid, res);
 		return -ENOMEM;
 	}
 	bpf_printk("[DEBUG] [HELPER] Did not find an existing relative deadline for pid %d. Set new one to: %llu\n", pid, new_rel_dl.rel_deadline);
@@ -584,7 +584,7 @@ void BPF_STRUCT_OPS(deadline_wheel_disable, struct task_struct *p)
 		{
 			scx_bpf_error("[ERROR] [DISABLE] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 		}
-		__sync_val_compare_and_swap(&bucket->sem, 1, 0);
+		sunlock(&bucket->sem);
 		
 		
 	}
@@ -798,8 +798,8 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	{
 		scx_bpf_error("[ERROR] [HELPER] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 	}
-	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
-	if(b_data) {__sync_val_compare_and_swap(&b_data->sem, 1, 0);}
+	sunlock(&bucket->sem);
+	if(b_data) {sunlock(&b_data->sem);}
 	
 	return 0;
 }
@@ -962,7 +962,7 @@ static inline int fetch_from_bucket(u64 bucket_idx, struct bucket_bitmask_data *
 	}
 
 	done:
-	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
+	sunlock(&bucket->sem);
 	return pid;
 }
 
@@ -1103,7 +1103,7 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 			if(pid == -1) {bpf_printk("[DISPATCH] Found %d but bucket was empty", highest_nonempty_idx);}
 		}
 		// bpf_spin_unlock(&b_data->lock);
-		__sync_val_compare_and_swap(&b_data->sem, 1, 0);
+		sunlock(&b_data->sem);
 	}
 	if(!b_data || pid == -1) {return;}
     
@@ -1343,11 +1343,11 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 			// 	bucket_idx);
 
 		}
-		__sync_val_compare_and_swap(&b_data->sem, 1, 0);
+		sunlock(&b_data->sem);
 	 }
 
 	dequeue_done:
-	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
+	sunlock(&b_data->sem);
 }
 
 void BPF_STRUCT_OPS(deadline_wheel_dump, struct scx_dump_ctx *dctx)
