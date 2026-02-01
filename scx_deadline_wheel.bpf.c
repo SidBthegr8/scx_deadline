@@ -937,6 +937,10 @@ static inline int fetch_from_bucket(u64 bucket_idx, struct bucket_bitmask_data *
 			//     atnode->pid);
 	    }
 		bool can_run_on_cpu = bpf_cpumask_test_cpu(cpu, tstruct->cpus_ptr);
+		if(tstruct->migration_disabled && (cpu != scx_bpf_task_cpu(tstruct)))
+		{
+			can_run_on_cpu = false;
+		}
 		bpf_task_release(tstruct);
 	    if (can_run_on_cpu) {
 		    list_del(&atnode->node);
