@@ -138,7 +138,8 @@ get_highest_bitmask_tree(struct bucket_bitmask_data *b_data)
 		if (val == 0)
 			return -1;
 
-		int highest_bit = 63 - __builtin_clzll(val);
+		// int highest_bit = 63 - __builtin_clzll(val);
+		int highest_bit = __builtin_ctzll(val);
 		if (l == 0)
 			return ((curr_idx * 64) + highest_bit);
 
@@ -759,6 +760,8 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 		if (atnode->pid == p_tctx->atnode->pid)
 		{
 			error = 1;
+			bpf_printk("Re-insertion error\n");
+			scx_bpf_error("Error, pid %d was already in list, but re-inserted it again.", p_tctx->atnode->pid);
 			break;
 		}
 	}
@@ -768,12 +771,6 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	print_bucket_list(bucket_idx, bucket);
 	// bpf_spin_unlock(&bucket->lock);
 	
-	
-	if (error)
-	{
-		bpf_printk("Re-insertion error\n");
-		scx_bpf_error("Error, pid %d was already in list, but re-inserted it again.", p_tctx->atnode->pid);
-	}
 	
 	
 	bpf_printk("Inserted pid %d into deadline wheel bucket %llu. Num tasks in bucket = %d\n", p_tctx->pid, bucket_idx, bucket->bucket_count);
