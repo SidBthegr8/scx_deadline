@@ -231,8 +231,8 @@ __hidden void scx_arena_subprog_init(void)
 	scx_arena_verify_once = true;
 }
 
-struct arena_list_head __arena* list_head;
-struct arena_list_head __arena global_head;
+
+// struct arena_list_head __arena global_head;
 
 struct arena_task_node {
 	struct arena_list_node node;
@@ -751,6 +751,7 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	bpf_printk("[INSERT] Got b_data->sem lock!!");
 	slock(&bucket->sem);
 	bpf_printk("[INSERT] Got bucket->sem lock!!");
+	struct arena_list_head __arena* list_head;
 	list_head = bucket->head_ptr;
 	p_tctx->atnode->bucket = bucket_idx;
 	struct arena_task_node __arena * atnode = NULL;
@@ -760,8 +761,9 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 		if (atnode->pid == p_tctx->atnode->pid)
 		{
 			error = 1;
-			bpf_printk("Re-insertion error\n");
+			bpf_printk("Re-insertion error, pid %d was already in list, but re-inserted it again.", p_tctx->atnode->pid);
 			scx_bpf_error("Error, pid %d was already in list, but re-inserted it again.", p_tctx->atnode->pid);
+			goto insert_done;
 			break;
 		}
 	}
@@ -795,6 +797,7 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	{
 		scx_bpf_error("[ERROR] [HELPER] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 	}
+	insert_done:
 	sunlock(&bucket->sem);
 	if(b_data) {sunlock(&b_data->sem);}
 	
@@ -808,7 +811,8 @@ void BPF_STRUCT_OPS(deadline_wheel_enqueue, struct task_struct *p, u64 enq_flags
 	bpf_printk("[INFO] [ENQUEUE] Enqueueing task %d (%s).\n", p->pid, p->comm);
 	//Check for any idle CPUs this task can run on
 	s32 idle_cpu;
-	if (!(enq_flags & SCX_ENQ_REENQ) && !(enq_flags & SCX_ENQ_CPU_SELECTED) && (idle_cpu = find_idle_cpu(p, scx_bpf_task_cpu(p))) >= 0) {
+	s32 task_cpu = scx_bpf_task_cpu(p);
+	if ((enq_flags & SCX_ENQ_REENQ) && !(enq_flags & SCX_ENQ_CPU_SELECTED) && ((idle_cpu = find_idle_cpu(p, scx_bpf_task_cpu(p))) >= 0) && !(is_migration_disabled(p) && task_cpu!=idle_cpu)) {
 		bpf_printk("[INFO] [ENQUEUE] Enqueued task %d (%s) directly in cpu %d local dsq.\n", p->pid, p->comm, idle_cpu);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | idle_cpu, SCX_SLICE_INF, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
 		scx_bpf_kick_cpu(idle_cpu, SCX_KICK_PREEMPT);
@@ -817,7 +821,7 @@ void BPF_STRUCT_OPS(deadline_wheel_enqueue, struct task_struct *p, u64 enq_flags
 
 	// Check if there's a sched_ext task dispatched to a CPU, which has a later absolute deadline
 	s32 lower_priority_cpu = find_lower_priority_cpu(p);
-	if (lower_priority_cpu >= 0)
+	if (lower_priority_cpu >= 0 && !(is_migration_disabled(p) && task_cpu!=lower_priority_cpu))
 	{
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | lower_priority_cpu, SCX_SLICE_INF, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
 		scx_bpf_kick_cpu(lower_priority_cpu, SCX_KICK_PREEMPT);
@@ -831,8 +835,19 @@ void BPF_STRUCT_OPS(deadline_wheel_enqueue, struct task_struct *p, u64 enq_flags
 		scx_bpf_error("task_ctx does not exist for %d in enqueue.", p->pid);
 		return;
 	}
+	
 	// scx_bpf_dsq_insert(p, FALLBACK_DSQ_ID, SCX_SLICE_INF, enq_flags);
 	u64 bucket_idx = (p_tctx->abs_deadline) % NUM_BUCKETS;
+	if (p_tctx->atnode->in_bucket) {
+		bpf_printk("[ENQUEUE] Task %d is already in bucket", p_tctx->pid);
+		if(p_tctx->atnode->bucket==bucket_idx){
+			bpf_printk("[ENQUEUE] Task %d was already in bucket %d", p_tctx->pid, bucket_idx);
+			return;
+		}
+		else{
+			scx_bpf_error("[ENQUEUE] Task %d was already in bucket %d, attempting to reinsert in different bucket %d", p_tctx->pid, p_tctx->atnode->bucket, bucket_idx);
+		} 
+    }
 	bpf_printk("[INFO] [ENQUEUE] No idle CPU or CPU w/ lower priority task. Putting pid %d (abs_deadline %llu) into bucket %llu\n", 
 			p->pid, p_tctx->abs_deadline, bucket_idx);
 	insert_task_into_deadline_wheel_bucket(p_tctx, bucket_idx);
@@ -929,6 +944,7 @@ static inline int fetch_from_bucket(u64 bucket_idx, struct bucket_bitmask_data *
 	struct arena_task_node __arena* atnode = NULL;
 	list_for_each_entry(atnode, bucket->head_ptr, node)	
 	{
+		if (!(atnode->cpumask & (1ULL << cpu))) continue;
 		struct task_struct *tstruct = bpf_task_from_pid(atnode->pid);
 	    if (!tstruct) {
 			goto done;
@@ -937,11 +953,11 @@ static inline int fetch_from_bucket(u64 bucket_idx, struct bucket_bitmask_data *
 			//     atnode->pid);
 	    }
 		bool can_run_on_cpu = bpf_cpumask_test_cpu(cpu, tstruct->cpus_ptr);
-		if(tstruct->migration_disabled && (cpu != scx_bpf_task_cpu(tstruct)))
+		if((is_migration_disabled(tstruct)) && (cpu != scx_bpf_task_cpu(tstruct)))
 		{
 			can_run_on_cpu = false;
 		}
-		bpf_task_release(tstruct);
+		
 	    if (can_run_on_cpu) {
 		    list_del(&atnode->node);
 			pid = atnode->pid;
@@ -958,8 +974,10 @@ static inline int fetch_from_bucket(u64 bucket_idx, struct bucket_bitmask_data *
 				// 	"[FETCH_FROM_BUCKET] Disabled bit using clear_bitmask_tree for bucket index %llu",
 				// 	bucket_idx);
 			}
+			bpf_task_release(tstruct);
 			break;
 	    }
+		bpf_task_release(tstruct);
 	}
 
 	done:
@@ -1165,7 +1183,9 @@ void BPF_STRUCT_OPS(deadline_wheel_dispatch, s32 cpu, struct task_struct *prev)
 					pid);
 				return;
 			}
+			if (!(is_migration_disabled(tstruct) && (cpu != scx_bpf_task_cpu(tstruct)))) {
 			scx_bpf_dsq_insert(tstruct, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_INF, SCX_ENQ_HEAD|SCX_ENQ_PREEMPT);
+			}
 		    // u64 mask = (u64) * (int *)tstruct->cpus_ptr;
 		    bpf_task_release(tstruct);
 
@@ -1315,6 +1335,7 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 	s32 key = 0;
 	struct bucket_bitmask_data *b_data =
 		bpf_map_lookup_elem(&bucket_bitmask_map, &key);
+	slock(&b_data->sem);
 	slock(&bucket->sem);
 	bpf_printk("[DEQUEUE] Got bucket->sem lock!!!!");
 	if (bucket->bucket_count == 0)
@@ -1327,7 +1348,7 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 		// scx_bpf_error("Invalid bucket head pointer for bucket %llu.", bucket_idx);
 	}
 	if (tctx->atnode->in_bucket){
-		slock(&b_data->sem);
+		
 		list_del(&tctx->atnode->node);
 		tctx->atnode->in_bucket = false;
 		bucket->bucket_count--;
@@ -1344,10 +1365,11 @@ void BPF_STRUCT_OPS(deadline_wheel_dequeue, struct task_struct *p, u64 deq_flags
 			// 	bucket_idx);
 
 		}
-		sunlock(&b_data->sem);
+		
 	 }
 
 	dequeue_done:
+	sunlock(&bucket->sem);
 	sunlock(&b_data->sem);
 }
 
