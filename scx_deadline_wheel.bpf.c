@@ -189,7 +189,7 @@ static inline long slock_work(u32 index, void *ctx){
 	return 0;
 }
 
-static void slock(int* val){
+static void slock(int* val){   
 	// bpf_printk("[SLOCK] Entering slock");	
 	struct slock_ctx lctx = { .val = val, .got_lock = false};
 	u32 iters = 1<<23;
@@ -743,6 +743,11 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	}
 
 	// bpf_spin_lock(&bucket->lock);
+	u32 bitmask_key = 0;
+	struct bucket_bitmask_data *b_data =
+		bpf_map_lookup_elem(&bucket_bitmask_map, &bitmask_key);
+	if(b_data) slock(&b_data->sem);
+	bpf_printk("[INSERT] Got b_data->sem lock!!");
 	slock(&bucket->sem);
 	bpf_printk("[INSERT] Got bucket->sem lock!!");
 	list_head = bucket->head_ptr;
@@ -777,25 +782,24 @@ static s32 insert_task_into_deadline_wheel_bucket(struct task_ctx *p_tctx, u64 b
 	// bucket_bitmask_array[u64_array_idx] |= (1 << bit_idx);
 	// bpf_printk("Enabled bit for bucket index %llu; array idx = %d, bit idx = %d, bucket_bitmask_array[%d]=0x%x\n", 
 	// 		bucket_idx, u64_array_idx, bit_idx, u64_array_idx, bucket_bitmask_array[u64_array_idx]);
-
-	u32 bitmask_key = 0;
-	struct bucket_bitmask_data *b_data =
-		bpf_map_lookup_elem(&bucket_bitmask_map, &bitmask_key);
-	if (b_data) {
-		// bpf_spin_lock(&b_data->lock);
-		slock(&b_data->sem);
-		bpf_printk("[INSERT] Got b_data lock!!!");
-		set_bitmask_tree(b_data, bucket_idx);
-		print_bucket_tree();
-		// bpf_spin_unlock(&b_data->lock);
-		__sync_val_compare_and_swap(&b_data->sem, 1, 0);
-	}
+	set_bitmask_tree(b_data, bucket_idx);
+	print_bucket_tree();
+	
+	// if (b_data) {
+	// 	// bpf_spin_lock(&b_data->lock);
+	// 	// slock(&b_data->sem);
+	// 	// bpf_printk("[INSERT] Got b_data lock!!!");
+		
+	// 	// bpf_spin_unlock(&b_data->lock);
+	// 	__sync_val_compare_and_swap(&b_data->sem, 1, 0);
+	// }
 
 	if (bucket->bucket_count < 0)
 	{
 		scx_bpf_error("[ERROR] [HELPER] Number of tasks in bucket %llu is %d\n", bucket_idx, bucket->bucket_count);
 	}
 	__sync_val_compare_and_swap(&bucket->sem, 1, 0);
+	if(b_data) {__sync_val_compare_and_swap(&b_data->sem, 1, 0);}
 	
 	return 0;
 }
