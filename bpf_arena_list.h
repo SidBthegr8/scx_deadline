@@ -4,14 +4,12 @@
 #include "bpf_arena_common.h"
 
 struct arena_list_node;
-struct arena_list_head;
 
 typedef struct arena_list_node __arena arena_list_node_t;
 
 struct arena_list_node {
 	arena_list_node_t *next;
 	arena_list_node_t * __arena *pprev;
-	struct arena_list_head __arena *head;
 };
 
 struct arena_list_head {
@@ -62,34 +60,20 @@ static inline void list_add_head(arena_list_node_t *n, arena_list_head_t *h)
 	cast_user(tmp);
 	cast_kern(n);
 	WRITE_ONCE(n->pprev, tmp);
-	WRITE_ONCE(n->head, h);	
 }
 
 static inline void __list_del(arena_list_node_t *n)
 {
-	arena_list_node_t *next = n->next, *tmp;
+	arena_list_node_t *next = n->next;
 	arena_list_node_t * __arena *pprev = n->pprev;
-	struct arena_list_head __arena *head = n->head;
 
 	cast_user(next);
 	cast_kern(pprev);
-	tmp = *pprev;
-	cast_kern(tmp);
-	WRITE_ONCE(tmp, next);
+	WRITE_ONCE(*pprev, next);
 	if (next) {
-		if (head->first == n)
-		{
-			head->first = next;
-		}
 		cast_user(pprev);
 		cast_kern(next);
 		WRITE_ONCE(next->pprev, pprev);
-	}
-	else {
-		if (head->first == n)
-		{
-			head->first = NULL;
-		}
 	}
 }
 
@@ -103,5 +87,4 @@ static inline void list_del(arena_list_node_t *n)
 	__list_del(n);
 	n->next = LIST_POISON1;
 	n->pprev = LIST_POISON2;
-	n->head = NULL;
 }
