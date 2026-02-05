@@ -531,13 +531,24 @@ void BPF_STRUCT_OPS(deadline_wheel_enable, struct task_struct *p)
 	}
 	bpf_printk("Allocated node for pid %d at address 0x%x\n", p->pid, new_atnode);
 	
-	new_atnode->pid = p->pid;
+	int pid = p->pid;
+	// new_atnode->pid = p->pid;
+	new_atnode->pid = pid;
+	int new_atnode_pid = new_atnode->pid;
 	new_atnode->cpumask = 0;
 	new_atnode->in_bucket = false;
-
-	// Set the context parameters
+	if(pid!=new_atnode->pid)
+	{
+		scx_bpf_error("[ENABLE] pid %d is different from new_atnode->pid %d", pid, new_atnode->pid);
+	}
+		// Set the context parameters
 	bpf_spin_lock(&tctx->lock);
+	cast_kern(new_atnode);
 	tctx->atnode = new_atnode;
+	// tctx->atnode->pid = p->pid;
+	// tctx->atnode->cpumask = 0;
+	tctx->atnode->in_bucket = false;
+	
 	tctx->abs_deadline = abs_deadline;
 	tctx->pid = p->pid;
 	tctx->valid = true;
@@ -548,7 +559,10 @@ void BPF_STRUCT_OPS(deadline_wheel_enable, struct task_struct *p)
 	struct arena_task_node __arena* atnode_addr = tctx->atnode;
 	struct arena_list_node __arena* list_node_addr = NULL;
 	if (tctx->atnode) list_node_addr = &(tctx->atnode->node);
-
+	if(tctx->pid!=tctx->atnode->pid)
+	{
+		scx_bpf_error("[ENABLE] task's real pid %d does not match atnode's pid %d, new_atnode->pid: %d, new_atnode_pid: %d, p->pid: %d, pid: %d, tctx->atnode->cpumask: %x, tctx->atnode->in_bucket: %d", tctx->pid, tctx->atnode->pid, new_atnode->pid, new_atnode_pid, p->pid, pid, tctx->atnode->cpumask, tctx->atnode->in_bucket);
+	}
 	u64 time_from_now_us = (abs_deadline - scx_bpf_now())/1000ULL;
 	scx_bpf_task_set_slice(p, SCX_SLICE_INF);
 	bpf_printk("[DEBUG] [ENABLE] Task %d (%s) policy=%u, mask=%x, node = 0x%x, atnode = 0x%x\n", 
@@ -913,21 +927,26 @@ void BPF_STRUCT_OPS(deadline_wheel_running, struct task_struct *p)
 
 	// bpf_spin_lock(&curr_task->lock);
 	slock(&curr_task->sem);
+	// int preempter_pid = curr_task->preempter_pid;
+	// bool was_preempter = (curr_task->preempter_pid==p->pid);
+	// bool was_preempting = (curr_task->preempted);
+	if(curr_task->preempted && curr_task->preempter_pid!=p->pid && curr_task->curr_pid!=p->pid && curr_task->curr_pid!=-1)
+	{
+		sunlock(&curr_task->sem);
+		scx_bpf_error("[RUNNING] task %d was not the latest preempter (%d) or preempted task (%d)", p->pid, curr_task->preempter_pid, curr_task->curr_pid);
+		return;
+	}
+	if(curr_task->preempted && curr_task->preempter_pid==p->pid){
+		curr_task->preempter_pid = -1;
+		curr_task->preempted = false;
+	}
+	
 	curr_task->valid = true;
 	curr_task->curr_pid = p->pid;
 	curr_task->curr_abs_dl = tctx->abs_deadline;
-	int preempter_pid = curr_task->preempter_pid;
-	bool was_preempter = (curr_task->preempter_pid==p->pid);
-	bool was_preempting = (curr_task->preempted);
-	curr_task->preempter_pid = -1;
-	curr_task->preempted = false;
 	// bpf_spin_unlock(&curr_task->lock);
 	sunlock(&curr_task->sem);
-	if(was_preempting && !was_preempter)
-	{
-		scx_bpf_error("[RUNNING] task %d was not the latest preempter (%d)", p->pid, preempter_pid);
-		return;
-	}
+	
 
 	u64 now = scx_bpf_now();
 	bpf_printk("[INFO] [RUNNING] Running task %d (%s) on cpu %d (Abs. DL = %llu) [slice=%llu]\n", p->pid, p->comm, cpu, tctx->abs_deadline, p->scx.slice);
